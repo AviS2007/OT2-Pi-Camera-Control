@@ -1,0 +1,17 @@
+[Unit]
+Description=USB-C gadget (NCM network + ACM serial)
+DefaultDependencies=no
+After=sys-kernel-config.mount systemd-modules-load.service systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+Before=network-pre.target NetworkManager.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/ot2cam/usb-gadget.sh
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=sysinit.target

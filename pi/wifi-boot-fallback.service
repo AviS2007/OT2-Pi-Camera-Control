@@ -1,0 +1,12 @@
+[Unit]
+Description=Start the OT-2 camera hotspot if no known Wi-Fi was joined shortly after boot
+After=NetworkManager.service network.target
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 45
+ExecStart=/bin/sh -c 'if ! nmcli -t -f DEVICE,STATE dev status | grep -q "^wlan0:connected"; then nmcli con up ot2-hotspot && logger -t wifi-boot-fallback "no known network joined; hotspot OT2-Cam-Pi up"; else logger -t wifi-boot-fallback "wlan0 already connected"; fi'
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=Join a known Wi-Fi if in range, otherwise run the OT-2 camera hotspot
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/ot2cam/wifi-fallback.sh

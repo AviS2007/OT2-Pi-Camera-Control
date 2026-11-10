@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodic Wi-Fi / hotspot selection for the OT-2 camera Pi
+
+[Timer]
+OnBootSec=25s
+OnUnitActiveSec=2min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
