@@ -64,7 +64,7 @@ fi
 
 echo "== files -> /opt/ot2cam"
 install -d /opt/ot2cam
-install -m 755 "$HERE/camserver.py" "$HERE/record.py" "$HERE/usb-gadget.sh" "$HERE/wifi.sh" "$HERE/wifi-fallback.sh" "$HERE/install.sh" /opt/ot2cam/
+install -m 755 "$HERE/camserver.py" "$HERE/record.py" "$HERE/usb-gadget.sh" "$HERE/wifi.sh" "$HERE/wifi-fallback.sh" "$HERE/wifi-watchdog.sh" "$HERE/install.sh" /opt/ot2cam/
 ln -sf /opt/ot2cam/record.py /usr/local/bin/ot2-record
 ln -sf /opt/ot2cam/wifi.sh   /usr/local/bin/ot2-wifi
 install -d -o "$USER_NAME" -g "$USER_NAME" "$HOME_DIR/recordings"
@@ -72,15 +72,18 @@ install -d -o "$USER_NAME" -g "$USER_NAME" "$HOME_DIR/recordings"
 echo "== systemd units"
 install -m 644 "$HERE/usb-gadget.service" /etc/systemd/system/usb-gadget.service
 sed "s/__USER__/$USER_NAME/g" "$HERE/camserver.service" > /etc/systemd/system/camserver.service
-install -m 644 "$HERE/wifi-fallback.service" "$HERE/wifi-fallback.timer" "$HERE/wifi-boot-fallback.service" /etc/systemd/system/
+install -m 644 "$HERE/wifi-fallback.service" "$HERE/wifi-fallback.timer" "$HERE/wifi-boot-fallback.service" "$HERE/wifi-watchdog.service" /etc/systemd/system/
 # wifi-boot-fallback: one-shot at boot (hotspot only if nothing joined). wifi-fallback.timer (periodic
 # re-selection) is installed but left disabled; enable by hand if wanted.
-systemctl enable usb-gadget.service camserver.service wifi-boot-fallback.service serial-getty@ttyGS0.service ssh >/dev/null 2>&1 || true
+# wifi-watchdog: rejoins when the Windows hotspot silently drops the client (gateway unpingable 90 s).
+systemctl enable usb-gadget.service camserver.service wifi-boot-fallback.service wifi-watchdog.service serial-getty@ttyGS0.service ssh >/dev/null 2>&1 || true
 
 echo "== NetworkManager: usb0 = 10.55.0.1/24, DHCP for the PC"
 install -d -m 755 "$NMDIR" /etc/NetworkManager/conf.d
 # NM leaves USB gadget interfaces unmanaged by default; take usb0 over explicitly
 printf '[device-usb-gadget]\nmatch-device=interface-name:usb0\nmanaged=1\n' > /etc/NetworkManager/conf.d/10-usb-gadget.conf
+# Wi-Fi power saving off: with it on, the Windows Mobile Hotspot silently dropped the Pi after idle.
+printf '[connection]\nwifi.powersave=2\n' > /etc/NetworkManager/conf.d/20-wifi-powersave.conf
 if [ ! -f "$NMDIR/usb-gadget.nmconnection" ]; then
 cat > "$NMDIR/usb-gadget.nmconnection" <<TXT
 [connection]

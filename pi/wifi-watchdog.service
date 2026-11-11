@@ -1,0 +1,12 @@
+[Unit]
+Description=Wi-Fi link watchdog (rejoin when the hotspot silently drops us)
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+ExecStart=/opt/ot2cam/wifi-watchdog.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

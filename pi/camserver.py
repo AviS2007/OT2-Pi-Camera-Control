@@ -16,8 +16,8 @@ HTTP API (default port 8080):
   GET /record/stop           stop recording
   GET /files                 JSON list of recordings
 
-Usage:  camserver.py [--port 8080] [--size 1280x720] [--fps 30] [--bitrate 6000000]
-                     [--outdir ~/recordings] [--autorecord]
+Usage:  camserver.py [--port 8080] [--size auto|1280x720] [--fps 30] [--quality very_high]
+                     [--bitrate N] [--rotate180 0,1] [--outdir ~/recordings] [--autorecord]
 """
 import argparse
 import datetime as dt
@@ -73,21 +73,28 @@ class Cam:
     funnelled through one long-lived worker thread.
     """
 
-    def __init__(self, index, info, size, fps, lores, outdir, bitrate, rotate180=False):
+    def __init__(self, index, info, size, fps, lores, outdir, bitrate, quality, preview_quality, rotate180=False):
         self.index = index
         self.model = info.get("Model", "unknown")
         self.name = MODEL_NAMES.get(self.model, self.model)
         self.outdir = Path(outdir)
-        self.bitrate = bitrate
+        self.bitrate = bitrate or None          # None -> derive from quality
+        self.quality = quality
+        self.preview_quality = preview_quality
         self.rotate180 = rotate180
         self.recording_file = None
         self.lock = threading.Lock()
         self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cam{index}-ctl")
 
         self.picam = Picamera2(camera_num=index)
+        size, sensor = pick_size(self.picam, size, fps)
+        if lores is None:   # same aspect as the recording, 640 wide
+            lores = (640, (640 * size[1] // size[0]) & ~1)
+        self.size, self.lores, self.fps = size, lores, fps
         cfg = self.picam.create_video_configuration(
             main={"size": size, "format": "YUV420"},
             lores={"size": lores, "format": "YUV420"},
+            sensor=sensor,
             controls={"FrameRate": fps},
             transform=Transform(hflip=rotate180, vflip=rotate180),   # 180 deg for upside-down mounting
         )
@@ -98,8 +105,10 @@ class Cam:
         self.h264 = None
         self.picam.start()
         # MJPEG preview runs for the whole life of the server, from the small stream.
-        self.picam.start_encoder(self.mjpeg, FileOutput(self.preview), quality=Quality.MEDIUM, name="lores")
-        log.info("cam%d: %s (%s) main=%s lores=%s fps=%s rotate180=%s", index, self.model, self.name, size, lores, fps, rotate180)
+        self.picam.start_encoder(self.mjpeg, FileOutput(self.preview), quality=preview_quality, name="lores")
+        log.info("cam%d: %s (%s) main=%s sensor=%s lores=%s fps=%s quality=%s preview=%s rotate180=%s", index,
+                 self.model, self.name, size, (sensor or {}).get("output_size"), lores, fps, quality.name,
+                 preview_quality.name, rotate180)
 
     def start_recording(self, tag):
         return self.worker.submit(self._start_recording, tag).result()
@@ -120,7 +129,7 @@ class Cam:
                 path, out = base.with_suffix(".mp4"), FfmpegOutput(str(base.with_suffix(".mp4")))
             else:  # no ffmpeg (Pi OS Lite): raw H.264 elementary stream, remux later on the PC
                 path, out = base.with_suffix(".h264"), FileOutput(str(base.with_suffix(".h264")))
-            self.picam.start_encoder(self.h264, out, name="main")
+            self.picam.start_encoder(self.h264, out, quality=self.quality, name="main")
             self.recording_file = str(path)
             log.info("cam%d: recording -> %s", self.index, path)
             return self.recording_file
@@ -187,6 +196,7 @@ def make_handler(cams, outdir):
             files = sorted(p.name for p in out.iterdir() if p.suffix in (".mp4", ".h264")) if out.exists() else []
             return {
                 "cameras": [{"index": c.index, "model": c.model, "name": c.name,
+                             "size": list(c.size), "fps": c.fps, "quality": c.quality.name,
                              "rotate180": c.rotate180, "recording": c.recording_file} for c in cams],
                 "recording": any(c.recording_file for c in cams),
                 "outdir": str(outdir),
@@ -273,17 +283,39 @@ class ThreadedServer(socketserver.ThreadingMixIn, server.HTTPServer):
 
 
 def parse_size(s):
+    if s.lower() == "auto":
+        return None
     w, h = s.lower().split("x")
     return int(w), int(h)
+
+
+def pick_size(picam, size, fps):
+    """Recording size and sensor mode. size=None ("auto"): the largest sensor mode that keeps the
+    full field of view (no crop) and can run at `fps`; e.g. V2 -> 1640x1232, Module 3 -> 2304x1296.
+    Cropped modes like the V2's 1920x1080 are skipped: they throw away most of the view."""
+    modes = picam.sensor_modes
+    full_w = max(m["crop_limits"][2] for m in modes)
+    full_h = max(m["crop_limits"][3] for m in modes)
+    full = [m for m in modes if tuple(m["crop_limits"]) == (0, 0, full_w, full_h)]
+    if size is not None:
+        return size, None
+    ok = [m for m in full if m["fps"] >= fps] or full
+    best = max(ok, key=lambda m: m["size"][0] * m["size"][1])
+    return tuple(best["size"]), {"output_size": tuple(best["size"]), "bit_depth": best["bit_depth"]}
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=8080)
-    ap.add_argument("--size", default="1280x720", help="recording resolution (default 1280x720)")
-    ap.add_argument("--lores", default="640x360", help="preview resolution (default 640x360)")
+    ap.add_argument("--size", default="auto", help="recording resolution, WxH or auto = largest full-view "
+                    "sensor mode that reaches --fps (default auto)")
+    ap.add_argument("--lores", default="auto", help="preview resolution (default auto: 640 wide, same aspect)")
     ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--bitrate", type=int, default=6_000_000, help="H.264 bitrate in bit/s")
+    ap.add_argument("--quality", default="very_high", choices=[q.name.lower() for q in Quality],
+                    help="encoder quality tier for recording and preview (default very_high)")
+    ap.add_argument("--bitrate", type=int, default=0, help="fixed H.264 bitrate in bit/s (0 = derive from --quality)")
+    ap.add_argument("--preview-quality", default="medium", choices=[q.name.lower() for q in Quality],
+                    help="MJPEG live-preview quality (default medium; very_high is ~8 Mbit/s per camera over Wi-Fi)")
     ap.add_argument("--outdir", default=os.path.expanduser("~/recordings"))
     ap.add_argument("--autorecord", action="store_true", help="start recording as soon as the server starts")
     ap.add_argument("--rotate180", default="", help="comma list of camera indexes mounted upside down, e.g. 1")
@@ -303,8 +335,9 @@ def main():
         log.warning("ffmpeg not installed: recordings will be raw .h264 (sudo apt install ffmpeg for .mp4)")
 
     flipped = {int(x) for x in a.rotate180.split(",") if x.strip()}
-    cams = [Cam(i.get("Num", n), i, parse_size(a.size), a.fps, parse_size(a.lores), a.outdir, a.bitrate,
-                rotate180=i.get("Num", n) in flipped)
+    quality, pquality = Quality[a.quality.upper()], Quality[a.preview_quality.upper()]
+    cams = [Cam(i.get("Num", n), i, parse_size(a.size), a.fps, parse_size(a.lores), a.outdir, a.bitrate, quality,
+                pquality, rotate180=i.get("Num", n) in flipped)
             for n, i in enumerate(infos)]
 
     if a.autorecord:

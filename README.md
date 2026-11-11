@@ -40,6 +40,32 @@ No laptop hotspot? The Pi broadcasts `OT2-Cam-Pi` (password `ot2camera`) instead
 - Pi boots, both cameras work: camera 0 = V2 (imx219, CAM1 connector), camera 1 = Module 3 Wide
   (imx708, CAM0 connector). Login `ot2` / `ot2cam`, hostname `ot2-cam-pi`. picamera2 0.3.31 and ffmpeg
   are installed; `camserver` runs on boot; H.264 .mp4 recording from both cameras verified.
+- Both cameras are mounted upside down on the OT-2, so the service runs with `--rotate180 0,1` and
+  `ot2-record` defaults to the same. The 180° transform is done in libcamera, so streams, snapshots
+  and recordings are all upright. `--rotate180 ""` for none, `--rotate180 1` for one camera;
+  `/status` reports `rotate180` per camera.
+- Quality is set to the maximum that still gives 30 fps with the full field of view (2026-11-11):
+  `--size auto --quality very_high`. auto picks the largest *uncropped* sensor mode that reaches
+  `--fps`: V2 1640x1232, Module 3 Wide 2304x1296 (the V2's 1920x1080 mode is a centre crop and is
+  skipped; the full 8/12 MP modes only do 21/14 fps). very_high lets picamera2 derive the H.264
+  bitrate from the resolution (measured 15 and 18 Mbit/s), so a minute of both cameras is ~250 MB.
+  The live preview has its own `--preview-quality` (default medium, ~3.7 Mbit/s per camera over the
+  hotspot; very_high was 8.5 Mbit/s per camera and made the page stall). It never affects the files.
+- **Thermal:** the Pi has no fan and idles at ~77 °C in its mount. Recording both cameras at these
+  settings pushes it to 86 °C within 15 s, the CPU throttles from 2.4 to 1.5 GHz, and over 90 s the
+  wide camera dropped ~1.5 % of frames (V2 none). Fit the official Pi 5 Active Cooler (fan header is
+  next to the Ethernet jack) or give the enclosure airflow. Until then, if dropped frames matter more
+  than resolution, use the lighter setting in `camserver.service`:
+  `--size 1280x720 --quality high` (verified ~15 % CPU per camera, no throttling).
+- **Silent hotspot drops (seen 2026-11-11 13:00):** the Windows hotspot logged "Wireless security
+  stopped" for the Pi and stopped forwarding, but never sent a deauth, so the Pi believed it was
+  connected for 4 minutes until it was power-cycled. Two countermeasures are installed: Wi-Fi power
+  saving is off (`/etc/NetworkManager/conf.d/20-wifi-powersave.conf`), and `wifi-watchdog.service`
+  probes the gateway every 30 s and re-joins the current profile after 3 misses (it ignores the
+  Pi's own `ot2-hotspot` AP mode). It judges the link by ARP reachability, not ping replies: the
+  laptop's firewall treats the hotspot as a Public network and drops ICMP echo, so `ping
+  192.168.137.1` from the Pi always fails even when the link is fine (use `ip neigh` instead).
+  Check the watchdog with `journalctl -t wifi-watchdog`.
 - **How the Pi gets network today:** the laptop's Windows Mobile Hotspot, SSID `OT2-Uplink`, password
   `ot2uplink1` (Settings > Network & internet > Mobile hotspot, sharing the UofT Wi-Fi). The Pi joins it
   automatically (profile priority 20), gets internet through the laptop, and the laptop reaches it at
@@ -50,6 +76,8 @@ No laptop hotspot? The Pi broadcasts `OT2-Cam-Pi` (password `ot2camera`) instead
   a scripted hop (join, ssh, rejoin UofT in one command). NetworkManager chooses once at boot;
   `wifi-fallback.timer` (periodic re-selection) exists but is **disabled** on the lab Pi because it
   caused join/drop loops. Enable with `sudo systemctl enable --now wifi-fallback.timer` if wanted.
+  `wifi-watchdog.service` (enabled) only re-joins the *current* profile when its gateway goes quiet;
+  it never switches networks, so it cannot loop the way the timer did.
 - Saved lab Wi-Fi `AC-IoT-NOKIA` exists on the Pi but is out of range at this bench; autoconnect is off
   (`sudo nmcli con modify AC-IoT-NOKIA connection.autoconnect yes` to re-enable).
 - USB-C gadget is bound and NetworkManager manages `usb0` (10.55.0.1), but it has never enumerated on
@@ -110,7 +138,7 @@ from the main stream. Streaming never degrades the recorded file.
 | `/cam/0.jpg` | single snapshot |
 | `/record/start?name=run7` | start recording **both** cameras |
 | `/record/stop` | stop |
-| `/status`, `/files` | JSON |
+| `/status`, `/files` | JSON (status includes size, fps, quality and `rotate180` per camera) |
 
 Files go to `~/recordings/<timestamp>_<name>_cam<n>_<CamV2|CamV3Wide>.mp4`. From Python on the PC
 (for OT-2 protocol integration) it is just `requests.get("http://10.55.0.1:8080/record/start?name=step3")`.
@@ -118,8 +146,8 @@ Files go to `~/recordings/<timestamp>_<name>_cam<n>_<CamV2|CamV3Wide>.mp4`. From
 Headless CLI alternative on the Pi (stop `camserver` first, both can't own the cameras at once):
 ```bash
 sudo systemctl stop camserver
-ot2-record -d 60 -n run7              # 60 s, both cameras
-ot2-record --size 1920x1080 --fps 30  # until Ctrl-C
+ot2-record -d 60 -n run7              # 60 s, both cameras, auto size, very_high quality
+ot2-record --size 1280x720 --quality high   # lighter, until Ctrl-C
 ```
 Pure rpicam one-liners if Python ever misbehaves:
 ```bash
@@ -164,6 +192,8 @@ pi/camserver.py        dual-camera MJPEG stream + H.264 record HTTP server (syst
 pi/record.py           headless CLI recorder (ot2-record)
 pi/usb-gadget.sh       USB-C -> NCM network + ACM serial gadget (systemd: usb-gadget.service)
 pi/wifi.sh             nmcli / tailscale helpers (ot2-wifi)
+pi/wifi-watchdog.sh    re-joins Wi-Fi when the gateway stops answering (systemd: wifi-watchdog.service)
+pi/wifi-boot-fallback.service  45 s after boot: start the Pi's own hotspot if nothing joined
 pi/install.sh          installer; --offline and --online-only used by first boot
 boot/firstrun.sh       first-boot hook (runs install.sh --offline, removes itself, reboots)
 boot/authorized_keys   this PC's public key (~/.ssh/ot2cam_ed25519.pub)

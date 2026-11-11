@@ -7,8 +7,9 @@ Wants=network-online.target
 # OT2CAM_USER is substituted by install.sh
 User=__USER__
 Environment=PYTHONUNBUFFERED=1
-# --rotate180 1 : camera 1 (Module 3 Wide on the CAM/DISP 0 connector) is mounted upside down
-ExecStart=/usr/bin/python3 /opt/ot2cam/camserver.py --port 8080 --size 1280x720 --fps 30 --outdir /home/__USER__/recordings --rotate180 1
+# --rotate180 0,1 : both cameras are mounted upside down on the OT-2
+# --size auto     : largest full-view sensor mode at 30 fps (V2 1640x1232, Module 3 Wide 2304x1296)
+ExecStart=/usr/bin/python3 /opt/ot2cam/camserver.py --port 8080 --size auto --fps 30 --quality very_high --outdir /home/__USER__/recordings --rotate180 0,1
 Restart=on-failure
 RestartSec=3
 
