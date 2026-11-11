@@ -5,7 +5,7 @@ Headless recorder: record every attached Pi camera to .mp4 at once.
   record.py                 record until Ctrl-C
   record.py -d 60           record for 60 seconds
   record.py -d 60 -n run7   files named <ts>_run7_cam<n>_<model>.mp4
-  record.py --size 1280x720 --fps 30 --bitrate 6000000   (default: --size auto, --quality very_high)
+  record.py --size auto --quality very_high   (default 1280x720 / high; auto = largest full-view mode)
 
 Files land in ~/recordings by default. Use camserver.py instead if you also want a live view.
 """
@@ -42,9 +42,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-d", "--duration", type=float, default=0, help="seconds (0 = until Ctrl-C)")
     ap.add_argument("-n", "--name", default="", help="tag to put in the filename")
-    ap.add_argument("--size", default="auto", help="WxH, or auto = largest full-view sensor mode at --fps")
+    ap.add_argument("--size", default="1280x720", help="WxH, or auto = largest full-view sensor mode at --fps")
     ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--quality", default="very_high", choices=[q.name.lower() for q in Quality])
+    ap.add_argument("--quality", default="high", choices=[q.name.lower() for q in Quality])
     ap.add_argument("--bitrate", type=int, default=0, help="fixed bitrate (0 = derive from --quality)")
     ap.add_argument("--outdir", default=os.path.expanduser("~/recordings"))
     ap.add_argument("--cams", default="", help="comma list of camera indexes (default: all)")

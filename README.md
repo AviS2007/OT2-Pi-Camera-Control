@@ -44,19 +44,24 @@ No laptop hotspot? The Pi broadcasts `OT2-Cam-Pi` (password `ot2camera`) instead
   `ot2-record` defaults to the same. The 180° transform is done in libcamera, so streams, snapshots
   and recordings are all upright. `--rotate180 ""` for none, `--rotate180 1` for one camera;
   `/status` reports `rotate180` per camera.
-- Quality is set to the maximum that still gives 30 fps with the full field of view (2026-11-11):
-  `--size auto --quality very_high`. auto picks the largest *uncropped* sensor mode that reaches
-  `--fps`: V2 1640x1232, Module 3 Wide 2304x1296 (the V2's 1920x1080 mode is a centre crop and is
-  skipped; the full 8/12 MP modes only do 21/14 fps). very_high lets picamera2 derive the H.264
-  bitrate from the resolution (measured 15 and 18 Mbit/s), so a minute of both cameras is ~250 MB.
+- Two recording presets, switchable live from the page's **720p / 1080p** buttons or
+  `GET /profile?set=1080p` (refused with 409 while recording; stop first). The service boots in
+  **720p** because the Pi has no fan (see Thermal).
+  | preset | V2 (cam0) | Module 3 Wide (cam1) | quality | measured bitrate |
+  |---|---|---|---|---|
+  | 720p | 1280x720 | 1280x720 | high | ~7.5 Mbit/s each |
+  | 1080p | 1640x1232 | 1920x1080 | very_high | ~15 Mbit/s each |
+  Both presets always use an *uncropped* sensor mode (V2 1640x1232, Wide 2304x1296) and scale in
+  the ISP, so the field of view never changes. The V2 gets 1640x1232 in the 1080p preset because
+  its native 1920x1080 mode is a centre crop that loses most of the view. The full 8/12 MP modes
+  only do 21/14 fps, so there is no higher preset. `--size WxH --quality X` adds a custom preset.
   The live preview has its own `--preview-quality` (default medium, ~3.7 Mbit/s per camera over the
   hotspot; very_high was 8.5 Mbit/s per camera and made the page stall). It never affects the files.
-- **Thermal:** the Pi has no fan and idles at ~77 °C in its mount. Recording both cameras at these
-  settings pushes it to 86 °C within 15 s, the CPU throttles from 2.4 to 1.5 GHz, and over 90 s the
-  wide camera dropped ~1.5 % of frames (V2 none). Fit the official Pi 5 Active Cooler (fan header is
-  next to the Ethernet jack) or give the enclosure airflow. Until then, if dropped frames matter more
-  than resolution, use the lighter setting in `camserver.service`:
-  `--size 1280x720 --quality high` (verified ~15 % CPU per camera, no throttling).
+- **Thermal:** the Pi has no fan and idles at ~78 °C in its mount. Recording both cameras in the
+  1080p preset (or the former 2304x1296 setting) pushes it to 86 °C within 15 s, the CPU throttles
+  from 2.4 to 1.5 GHz, and over 90 s the wide camera dropped ~1.5 % of frames (V2 none). That is why
+  720p is the default; use 1080p for short clips, or fit the official Pi 5 Active Cooler (fan header
+  next to the Ethernet jack) and change `--profile` in `camserver.service` to boot in 1080p.
 - **Silent hotspot drops (seen 2026-11-11 13:00):** the Windows hotspot logged "Wireless security
   stopped" for the Pi and stopped forwarding, but never sent a deauth, so the Pi believed it was
   connected for 4 minutes until it was power-cycled. Two countermeasures are installed: Wi-Fi power
@@ -138,7 +143,8 @@ from the main stream. Streaming never degrades the recorded file.
 | `/cam/0.jpg` | single snapshot |
 | `/record/start?name=run7` | start recording **both** cameras |
 | `/record/stop` | stop |
-| `/status`, `/files` | JSON (status includes size, fps, quality and `rotate180` per camera) |
+| `/profile?set=720p` or `1080p` | switch recording preset live (409 while recording) |
+| `/status`, `/files` | JSON (status includes `profile`, size, fps, quality and `rotate180` per camera) |
 
 Files go to `~/recordings/<timestamp>_<name>_cam<n>_<CamV2|CamV3Wide>.mp4`. From Python on the PC
 (for OT-2 protocol integration) it is just `requests.get("http://10.55.0.1:8080/record/start?name=step3")`.

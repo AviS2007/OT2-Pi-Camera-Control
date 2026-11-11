@@ -16,8 +16,8 @@ HTTP API (default port 8080):
   GET /record/stop           stop recording
   GET /files                 JSON list of recordings
 
-Usage:  camserver.py [--port 8080] [--size auto|1280x720] [--fps 30] [--quality very_high]
-                     [--bitrate N] [--rotate180 0,1] [--outdir ~/recordings] [--autorecord]
+Usage:  camserver.py [--port 8080] [--profile 720p|1080p] [--fps 30] [--rotate180 0,1]
+                     [--outdir ~/recordings] [--autorecord]   (GET /profile?set=1080p switches live)
 """
 import argparse
 import datetime as dt
@@ -51,6 +51,15 @@ MODEL_NAMES = {
 }
 
 
+# Recording presets, switchable at runtime from the web page or GET /profile?set=<name>.
+# "1080p" is per camera: a 16:9 sensor gives 1920x1080; a 4:3 sensor (Camera V2) gives its full-view
+# 1640x1232 instead, because the V2's native 1920x1080 mode is a centre crop that loses most of the view.
+PROFILES = {
+    "720p": {"size": (1280, 720), "quality": Quality.HIGH},          # cool: ~15 % CPU per camera
+    "1080p": {"size": "1080p", "quality": Quality.VERY_HIGH},        # hot: throttles without a fan
+}
+
+
 class StreamingOutput(io.BufferedIOBase):
     """Holds the latest MJPEG frame; wakes HTTP clients when a new one arrives."""
 
@@ -73,42 +82,65 @@ class Cam:
     funnelled through one long-lived worker thread.
     """
 
-    def __init__(self, index, info, size, fps, lores, outdir, bitrate, quality, preview_quality, rotate180=False):
+    def __init__(self, index, info, profile, fps, lores, outdir, bitrate, preview_quality, rotate180=False):
         self.index = index
         self.model = info.get("Model", "unknown")
         self.name = MODEL_NAMES.get(self.model, self.model)
         self.outdir = Path(outdir)
-        self.bitrate = bitrate or None          # None -> derive from quality
-        self.quality = quality
+        self.bitrate = bitrate or None          # None -> derive from the profile's quality
         self.preview_quality = preview_quality
         self.rotate180 = rotate180
+        self.fps = fps
+        self.lores_req = lores                  # None -> 640 wide, same aspect as the recording
         self.recording_file = None
         self.lock = threading.Lock()
         self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"cam{index}-ctl")
 
         self.picam = Picamera2(camera_num=index)
-        size, sensor = pick_size(self.picam, size, fps)
-        if lores is None:   # same aspect as the recording, 640 wide
-            lores = (640, (640 * size[1] // size[0]) & ~1)
-        self.size, self.lores, self.fps = size, lores, fps
+        self.preview = StreamingOutput()
+        self.mjpeg = None
+        self.h264 = None
+        self.profile = None
+        self._apply(profile)
+
+    def _apply(self, profile):
+        """(Re)configure the camera for a profile and restart the MJPEG preview. Only called from
+        __init__ or the worker thread, never while recording."""
+        spec = PROFILES[profile]
+        size, sensor = pick_size(self.picam, spec["size"], self.fps)
+        lores = self.lores_req or (640, (640 * size[1] // size[0]) & ~1)
         cfg = self.picam.create_video_configuration(
             main={"size": size, "format": "YUV420"},
             lores={"size": lores, "format": "YUV420"},
             sensor=sensor,
-            controls={"FrameRate": fps},
-            transform=Transform(hflip=rotate180, vflip=rotate180),   # 180 deg for upside-down mounting
+            controls={"FrameRate": self.fps},
+            transform=Transform(hflip=self.rotate180, vflip=self.rotate180),   # 180 deg for upside-down mounting
         )
+        if self.mjpeg is not None:
+            self.picam.stop_encoder(self.mjpeg)
+            self.picam.stop()
         self.picam.configure(cfg)
-
-        self.preview = StreamingOutput()
-        self.mjpeg = MJPEGEncoder()
-        self.h264 = None
         self.picam.start()
         # MJPEG preview runs for the whole life of the server, from the small stream.
-        self.picam.start_encoder(self.mjpeg, FileOutput(self.preview), quality=preview_quality, name="lores")
-        log.info("cam%d: %s (%s) main=%s sensor=%s lores=%s fps=%s quality=%s preview=%s rotate180=%s", index,
-                 self.model, self.name, size, (sensor or {}).get("output_size"), lores, fps, quality.name,
-                 preview_quality.name, rotate180)
+        self.mjpeg = MJPEGEncoder()
+        self.picam.start_encoder(self.mjpeg, FileOutput(self.preview), quality=self.preview_quality, name="lores")
+        self.profile, self.size, self.lores, self.quality = profile, size, lores, spec["quality"]
+        log.info("cam%d: %s (%s) profile=%s main=%s sensor=%s lores=%s fps=%s quality=%s preview=%s rotate180=%s",
+                 self.index, self.model, self.name, profile, size, (sensor or {}).get("output_size"), lores,
+                 self.fps, self.quality.name, self.preview_quality.name, self.rotate180)
+
+    def set_profile(self, profile):
+        return self.worker.submit(self._set_profile, profile).result()
+
+    def _set_profile(self, profile):
+        with self.lock:
+            if profile not in PROFILES:
+                return {"error": f"unknown profile {profile!r}", "profile": self.profile}
+            if self.h264:
+                return {"error": "stop recording first", "profile": self.profile}
+            if profile != self.profile:
+                self._apply(profile)
+            return {"profile": self.profile, "size": list(self.size)}
 
     def start_recording(self, tag):
         return self.worker.submit(self._start_recording, tag).result()
@@ -163,15 +195,23 @@ INDEX_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>OT-2 Pi 
 <style>body{font-family:system-ui;background:#111;color:#eee;margin:16px}
 .row{display:flex;flex-wrap:wrap;gap:16px}.cam{flex:1 1 480px}img{width:100%%;background:#000;border-radius:6px}
 button{font-size:16px;padding:8px 16px;margin:4px;border-radius:6px;border:0;cursor:pointer}
-#rec{background:#c33;color:#fff}#stop{background:#555;color:#fff}pre{background:#222;padding:8px;border-radius:6px;white-space:pre-wrap}</style>
+#rec{background:#c33;color:#fff}#stop{background:#555;color:#fff}pre{background:#222;padding:8px;border-radius:6px;white-space:pre-wrap}
+.prof{background:#333;color:#ccc}.prof.on{background:#2a7;color:#fff}#msg{color:#fc6;margin-left:8px}</style>
 </head><body><h2>OT-2 Pi Cameras</h2>
 <div><button id="rec" onclick="go('/record/start')">&#9679; Record all</button>
 <button id="stop" onclick="go('/record/stop')">&#9632; Stop</button>
-<button onclick="refresh()">Refresh status</button></div>
+<button onclick="refresh()">Refresh status</button>
+&nbsp; Quality: <button class="prof" id="p720p" onclick="prof('720p')">720p</button>
+<button class="prof" id="p1080p" onclick="prof('1080p')">1080p</button><span id="msg"></span></div>
 <div class="row">%s</div><pre id="status"></pre>
 <script>
 async function go(u){await fetch(u);refresh();}
-async function refresh(){const r=await fetch('/status');document.getElementById('status').textContent=JSON.stringify(await r.json(),null,2);}
+async function prof(p){const m=document.getElementById('msg');m.textContent='switching to '+p+'...';
+  const r=await fetch('/profile?set='+p);const j=await r.json();
+  m.textContent=r.ok?'':(j.cameras||[]).map(c=>c.error).filter(Boolean)[0]||j.error||'failed';refresh();}
+async function refresh(){const r=await fetch('/status');const j=await r.json();
+  document.getElementById('status').textContent=JSON.stringify(j,null,2);
+  for(const p of (j.profiles||[])){const b=document.getElementById('p'+p);if(b)b.className='prof'+(j.profile===p?' on':'');}}
 refresh();setInterval(refresh,3000);
 </script></body></html>"""
 
@@ -195,7 +235,9 @@ def make_handler(cams, outdir):
             out = Path(outdir)
             files = sorted(p.name for p in out.iterdir() if p.suffix in (".mp4", ".h264")) if out.exists() else []
             return {
-                "cameras": [{"index": c.index, "model": c.model, "name": c.name,
+                "profile": cams[0].profile if cams else None,
+                "profiles": list(PROFILES),
+                "cameras": [{"index": c.index, "model": c.model, "name": c.name, "profile": c.profile,
                              "size": list(c.size), "fps": c.fps, "quality": c.quality.name,
                              "rotate180": c.rotate180, "recording": c.recording_file} for c in cams],
                 "recording": any(c.recording_file for c in cams),
@@ -233,6 +275,16 @@ def make_handler(cams, outdir):
 
             if path == "/record/stop":
                 return self._json({"stopped": [c.stop_recording() for c in cams]})
+
+            if path == "/profile":
+                want = q.get("set", [""])[0]
+                if not want:
+                    return self._json({"profile": cams[0].profile if cams else None, "profiles": list(PROFILES)})
+                if want not in PROFILES:
+                    return self._json({"error": f"unknown profile {want!r}", "profiles": list(PROFILES)}, 400)
+                res = [c.set_profile(want) for c in cams]
+                code = 409 if any("error" in r for r in res) else 200
+                return self._json({"profile": cams[0].profile if cams else None, "cameras": res}, code)
 
             if path.startswith("/cam/"):
                 try:
@@ -297,23 +349,37 @@ def pick_size(picam, size, fps):
     full_w = max(m["crop_limits"][2] for m in modes)
     full_h = max(m["crop_limits"][3] for m in modes)
     full = [m for m in modes if tuple(m["crop_limits"]) == (0, 0, full_w, full_h)]
-    if size is not None:
-        return size, None
     ok = [m for m in full if m["fps"] >= fps] or full
-    best = max(ok, key=lambda m: m["size"][0] * m["size"][1])
-    return tuple(best["size"]), {"output_size": tuple(best["size"]), "bit_depth": best["bit_depth"]}
+
+    def sensor_of(m):
+        return {"output_size": tuple(m["size"]), "bit_depth": m["bit_depth"]}
+
+    def area(m):
+        return m["size"][0] * m["size"][1]
+
+    if size is None or size == "1080p":
+        best = max(ok, key=area)
+        w, h = best["size"]
+        if size == "1080p" and h > 1080 and abs(w / h - 16 / 9) < 0.02:
+            return (1920, 1080), sensor_of(best)
+        return (w, h), sensor_of(best)
+    # fixed WxH: the smallest full-view mode that covers it (never a cropped mode)
+    cover = [m for m in ok if m["size"][0] >= size[0] and m["size"][1] >= size[1]]
+    best = min(cover, key=area) if cover else max(ok, key=area)
+    return tuple(size), sensor_of(best)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=8080)
-    ap.add_argument("--size", default="auto", help="recording resolution, WxH or auto = largest full-view "
-                    "sensor mode that reaches --fps (default auto)")
+    ap.add_argument("--profile", default="720p", help="recording preset at start: 720p or 1080p (default 720p); "
+                    "switchable later from the page or /profile?set=")
+    ap.add_argument("--size", default="", help="custom preset instead: WxH, or auto = largest full-view sensor mode at --fps")
+    ap.add_argument("--quality", default="high", choices=[q.name.lower() for q in Quality],
+                    help="encoder quality for the custom --size preset (default high)")
     ap.add_argument("--lores", default="auto", help="preview resolution (default auto: 640 wide, same aspect)")
     ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--quality", default="very_high", choices=[q.name.lower() for q in Quality],
-                    help="encoder quality tier for recording and preview (default very_high)")
-    ap.add_argument("--bitrate", type=int, default=0, help="fixed H.264 bitrate in bit/s (0 = derive from --quality)")
+    ap.add_argument("--bitrate", type=int, default=0, help="fixed H.264 bitrate in bit/s (0 = derive from quality)")
     ap.add_argument("--preview-quality", default="medium", choices=[q.name.lower() for q in Quality],
                     help="MJPEG live-preview quality (default medium; very_high is ~8 Mbit/s per camera over Wi-Fi)")
     ap.add_argument("--outdir", default=os.path.expanduser("~/recordings"))
@@ -335,8 +401,14 @@ def main():
         log.warning("ffmpeg not installed: recordings will be raw .h264 (sudo apt install ffmpeg for .mp4)")
 
     flipped = {int(x) for x in a.rotate180.split(",") if x.strip()}
-    quality, pquality = Quality[a.quality.upper()], Quality[a.preview_quality.upper()]
-    cams = [Cam(i.get("Num", n), i, parse_size(a.size), a.fps, parse_size(a.lores), a.outdir, a.bitrate, quality,
+    profile = a.profile
+    if a.size:
+        PROFILES["custom"] = {"size": parse_size(a.size), "quality": Quality[a.quality.upper()]}
+        profile = "custom"
+    if profile not in PROFILES:
+        ap.error(f"--profile must be one of {', '.join(PROFILES)}")
+    pquality = Quality[a.preview_quality.upper()]
+    cams = [Cam(i.get("Num", n), i, profile, a.fps, parse_size(a.lores), a.outdir, a.bitrate,
                 pquality, rotate180=i.get("Num", n) in flipped)
             for n, i in enumerate(infos)]
 
